@@ -1,0 +1,1116 @@
+options
+{
+    LOOKAHEAD=5;
+    FORCE_LA_CHECK=true;
+    IGNORE_CASE=true;
+    STATIC=false;
+    OUTPUT_DIRECTORY="src/sas/parser/";
+}
+
+PARSER_BEGIN(SASplusParser)
+
+package sas.parser;
+
+import sas.data.*;
+import sas.data.SASAxiom.SASPair;
+import sas.util.CausalGraphLink;
+
+import javaff.graph.*;
+
+import java.io.PrintStream;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.Hashtable;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map.Entry;
+import java.util.StringTokenizer;
+
+import java.math.BigDecimal;
+
+public class SASplusParser
+{
+	/**
+	 * This problem contains all, infiltered information from the SAS translation, which comprised of the 
+	 * "output.sas", "test.group" and "all.groups". Some of the information in this is copied over to 
+	 * sasProblemOptimised. This has no DTGs or causal graph.
+	 */
+	public static SASProblem sasProblemAll = new SASProblem();
+	
+	/**
+	 * This problem is the filtered version of the "pure" problem which is parsed in from "output". It 
+	 * included DTGs and the causal graph.
+	 */
+	public static SASProblem sasProblemOptimised = new SASProblem();
+	/**
+	 *The translator doesn't guarantee the contents of the preprocess file will have its variables
+	 *in ascending order- something output.sas does seem to guarantee. Thus we need this incredibly
+	 *annoying index -> variable map for lookups.
+	 */
+	public static Map<Integer, Integer> varIndexMap = new HashMap<Integer, Integer>();
+
+	/**
+	 * The default cost of an action in SAS+. The translator often parses these as zero, but
+	 * in reality we want a transition to cost *something*! In addition to this, it allows a
+	 * distinction between axioms which cost nothing. Defaults to 1.
+	 */
+	private static double DefaultActionCost = 1d;
+	
+    public static SASProblem parse() throws FileNotFoundException, IOException, ParseException
+    {
+    	return SASplusParser.parse(new File("output.sas"), new File("test.groups"), new File("all.groups"), new File("output"));
+    } 
+    
+    public static SASProblem parse(File outputSas, File testGroups, File allGroups, File output) throws FileNotFoundException, IOException, ParseException
+    {
+		reset();
+		
+		parseOutputSAS(outputSas, SASplusParser.sasProblemAll);
+		System.out.println("Successfully parsed output.sas");
+				parseTestGroups(testGroups, SASplusParser.sasProblemAll);		System.out.println("Successfully parsed test.groups");		parseAllGroups(allGroups, SASplusParser.sasProblemAll);		System.out.println("Successfully parsed all.groups");
+		
+		//need to add mutexes and variables to the optimised problem because they 
+		//will not be re-parsed
+		SASplusParser.sasProblemOptimised.mutexes = SASplusParser.sasProblemAll.mutexes;
+		SASplusParser.sasProblemOptimised.variables = SASplusParser.sasProblemAll.variables;
+		SASplusParser.sasProblemOptimised.axioms = SASplusParser.sasProblemAll.axioms;
+		SASplusParser.sasProblemOptimised.derivedPredicates = SASplusParser.sasProblemAll.derivedPredicates;
+				parsePreprocess(output, SASplusParser.sasProblemOptimised);		System.out.println("Successfully parsed output preprocess file");
+
+		setupDefaultActionCosts(sasProblemAll);
+		setupDefaultActionCosts(sasProblemOptimised);
+		
+		sasProblemAll.setupInitialState();
+
+		return sasProblemOptimised; 
+	}
+	
+	    
+    protected static SASProblem parseTranslationKey(File outputSas, File testGroups, File allGroups) throws FileNotFoundException, IOException, ParseException
+    {
+		parseOutputSAS(outputSas, SASplusParser.sasProblemAll);
+		System.out.println("Successfully parsed output.sas");
+		
+		parseTestGroups(testGroups, SASplusParser.sasProblemAll);
+		System.out.println("Successfully parsed test.groups");
+		parseAllGroups(allGroups, SASplusParser.sasProblemAll);
+		System.out.println("Successfully parsed all.groups");
+
+		return sasProblemAll; 
+	}
+	
+	protected static SASProblem parsePreprocess(File file, SASProblem sp) throws FileNotFoundException, IOException, ParseException
+	{
+        FileReader tFileReader = new FileReader(file);
+		SASplusParser parser = new SASplusParser(tFileReader);
+        parser.parsePreprocess(sp);
+        tFileReader.close();
+        
+        return sasProblemOptimised;
+	}
+	
+	protected static void parseTestGroups(File file, SASProblem sp) throws FileNotFoundException, IOException, ParseException
+	{
+        FileReader tFileReader = new FileReader(file);
+		SASplusParser parser = new SASplusParser(tFileReader);
+        parser.parseTestGroups(sp);
+        tFileReader.close();
+	}
+
+    protected static void parseAllGroups(File file, SASProblem sp) throws FileNotFoundException, IOException, ParseException
+    {
+        FileReader tFileReader = new FileReader(file);
+		SASplusParser parser = new SASplusParser(tFileReader);
+        parser.parseAllGroups(sp);
+        tFileReader.close();
+    }
+    
+
+    protected static void parseOutputSAS(File file, SASProblem sp) throws FileNotFoundException, IOException, ParseException
+    {
+        FileReader tFileReader = new FileReader(file);
+		SASplusParser parser = new SASplusParser(tFileReader);
+        parser.parseOutputSAS(SASplusParser.sasProblemAll);
+        tFileReader.close();
+   	}
+   	
+	protected static void detectVariableNames(SASProblem sp)
+	{
+		// set up names for the variables in the DTGs. These are
+		// extrapolated in the same manner as 'all.groups' mutexes, but instead
+		// use test.groups variable domains.
+		int defaultCount = 0; // reset for test.groups variable domains
+		for (SASVariable v : sp.variables.values())
+		{
+			// PDDLObject var = null;
+			HashSet<SASParameter> common = null;
+			for (SASLiteral p : v.getValues())
+			{
+				if (p instanceof NoneOfThoseProposition)
+					continue;
+
+				if (common == null)
+				{
+					common = new HashSet<SASParameter>();
+					common.addAll(p.getParameters());
+				}
+				else
+				{
+					common.retainAll(p.getParameters());
+				}
+			}
+
+			SASParameter finalVar;
+			if (v.getValues().size() == 2 && v.getValues().contains(new NoneOfThoseProposition()))
+				finalVar = new SASDomainObject(defaultCount++);
+			else if (v.getValues().size() > 1 && common.size() == 1)
+				// && SAS.varDomains.containsKey(common.iterator().next()) ==
+				// false)
+				finalVar = (SASParameter) common.iterator().next();
+			else if (v.getValues().size() == 1 && v.getValues().contains(new NoneOfThoseProposition()))
+				finalVar = new SASDomainObject(defaultCount++);
+			else if (v.getValues().size() == 1)
+				finalVar = new SASParameter(v.getValues().get(0).toString());
+			else
+				finalVar = new SASDomainObject(defaultCount++);
+
+			// put the variable and the domain into the SAS problem
+			v.setObject(finalVar);
+		}
+	}
+   	
+	protected static void detectMutexVariableNames(SASProblem sp)
+	{
+		// try to detect the names of variables of the form (varX) by
+		// extrapolating common
+		// parameters from their mutexes. If none exist, just use a default name
+		int defaultCount = 0;
+		for (SASMutexGroup m : sp.mutexes.values())
+		{
+			HashSet<SASParameter> common = null;
+			for (SASLiteral p : m.getMutexes())
+			{
+				if (common == null)
+				{
+					common = new HashSet<SASParameter>();
+					common.addAll(p.getParameters());
+				}
+				else
+				{
+					common.retainAll(p.getParameters());
+				}
+			}
+	
+			SASParameter finalVar;
+			if (m.getMutexes().size() > 1 && common.size() == 1)
+				finalVar = common.iterator().next();
+			else if (m.getMutexes().size() == 1)
+				finalVar = new SASParameter(m.getMutexes().iterator().next()
+						.toString());
+			else
+				finalVar = new SASParameter("sasvar" + defaultCount++);
+	
+			m.setObject((SASParameter) finalVar);
+		}
+	}
+	
+	protected static void setupDefaultActionCosts(SASProblem sp)
+	{
+		for (SASAction a : sp.actions.values())
+		{
+			if (a instanceof SASAxiom == false)
+				a.setCost(SASplusParser.DefaultActionCost);
+			else
+				a.setCost(0);
+		}
+		
+		//this should probably already have been done in the above loop, but check anyway
+		for (Map<Integer, SASAxiom> v : sp.axioms.values())
+		{
+			for (SASAxiom ax : v.values())
+			{
+				ax.setCost(0);
+			}
+		}
+	}
+	
+   	
+   	public static void reset()
+   	{
+   		SASplusParser.sasProblemAll = new SASProblem();
+   		SASplusParser.sasProblemOptimised = new SASProblem();
+  		
+		SASplusParser.varIndexMap = new HashMap<Integer, Integer>();
+   	}
+}
+
+PARSER_END(SASplusParser)
+
+SKIP :
+{
+    " "
+|   "\r"
+|   "\t"
+|   "\n"
+}
+
+TOKEN:
+{
+    < OPEN: "(" >
+|   < CLOSE: ")" >
+|   < BEGIN_GOAL: "begin_goal" >
+|   < END_GOAL: "end_goal" >
+|   < BEGIN_METRIC: "begin_metric" >
+|   < END_METRIC: "end_metric" >
+|   < BEGIN_STATE: "begin_state" >
+|   < END_STATE: "end_state" >
+|   < BEGIN_OPERATOR: "begin_operator" >
+|   < END_OPERATOR: "end_operator" >
+|   < BEGIN_GROUPS: "begin_groups" >
+|   < END_GROUPS: "end_groups" >
+|   < BEGIN_VARIABLES: "begin_variables" >
+|   < END_VARIABLES: "end_variables" >
+|	< BEGIN_RULE: "begin_rule" >
+|	< END_RULE: "end_rule" >
+|	< BEGIN_SG: "begin_SG" >
+|	< END_SG: "end_SG" >
+| 	< BEGIN_DTG: "begin_DTG" >
+|	< END_DTG: "end_DTG" >
+|	< BEGIN_CG: "begin_CG" >
+|	< END_CG: "end_CG" >
+|   < GROUP: "group" >
+|	< NEW_AXIOM: ("new-axiom@"<NUMBER>) >
+|   < ATOM: "ATOM" >
+|   < NONE_OF_THOSE: "<none of those>" >
+|	< SEPARATOR: (":" | ",")>
+|   < NUMBER: ("-")? (["0"-"9"])+ ("." (["0"-"9"])+)? >
+|   < NAME: (["a"-"z", "_", "A"-"Z", "0"-"9", "-"])+ >
+//| 	< ANYTHING : ((<OPEN>)?(<CLOSE>)?|(<NEW_AXIOM>)?|(<NONE_OF_THOSE>)?|(<SEPARATOR>)?|(<NUMBER>)?|(<NAME>)?|(<SINGLE_LINE_COMMENT>)?)+ >
+}
+
+SPECIAL_TOKEN: 
+{
+    <SINGLE_LINE_COMMENT: (";")+ (~["\n", "\r"])* ("\n" | "\r" | "\r\n")>
+}
+
+// ******************************************************************************
+// *																			*
+// * 							Parse the 3 sasProblemAll+ files							*
+// *																			*
+// ******************************************************************************
+
+void parsePreprocess(SASProblem sp):
+{
+	Token t;
+	Map<Integer, DomainTransitionGraph> dtgs;
+}
+{
+	<NUMBER> //parse the legacy fast downward mpt solveable flag
+	(parseMetric(sp))?
+	parseVariableSection(sp)
+	parseInitialState(sp)
+	parseGoal(sp)
+	parseOperators(sp)
+	parseAxioms(sp) 
+	parseSG() 
+	dtgs = parseDTGs(sp)
+	parseCG(sp, dtgs.values())
+}
+
+
+void parseCG(SASProblem sp, Collection<DomainTransitionGraph> dtgs):
+{
+	Token t;
+	int varCounter = 0;
+	CausalGraph cg = new CausalGraph();
+	//must explicitely add every dtg vertex first
+	for (DomainTransitionGraph dtg : dtgs)
+	{
+		cg.addVertex(dtg);
+	}
+}
+{
+	<BEGIN_CG>
+	(
+		//variable id
+		t = <NUMBER>
+		{
+			int varId = this.varIndexMap.get(varCounter); 
+			int arcs = Integer.parseInt(t.toString());
+			for (int i = 0; i < arcs; i++)
+			{
+				int[] arr = parseSASVariableValuePair();
+				int target = this.varIndexMap.get(arr[0]);
+				CausalGraphLink e = cg.addEdge(varId, target);
+				e.setWeight(arr[1]);
+			}
+			
+			varCounter++;
+		}
+	)*
+	<END_CG>
+	{
+		cg.findLeavesAndRoots();
+
+		sp.causalGraph = cg;
+	}	
+}
+
+/**
+ * Parses the DTG section of the preprocess file. The map returned is of the form 
+ * (original var ID -> DTG). That is, the key is the correct DTG variable ID, not 
+ * the one from the preprocess variable section, ie 0 -> DTG(0), 1 -> DTG(1), not 1 -> DTG(2).
+ */
+Map<Integer, DomainTransitionGraph> parseDTGs(SASProblem sp):
+{
+	Token t;
+	DomainTransitionGraph dtg;
+	Map<Integer, DomainTransitionGraph> dtgs = new HashMap<Integer, DomainTransitionGraph>();
+	int varCount = 0;
+}
+{
+	(dtg = parseDTG(this.varIndexMap.get(varCount), sp)
+	{
+		dtgs.put(this.varIndexMap.get(varCount), dtg);
+	
+		varCount++;
+	})*
+	{
+		return dtgs;
+	}
+}
+
+  /**
+   * varId parameter is assumed to already be the correct var id from the lookup table.
+   * @param varId
+   * @return
+   * @throws ParseException
+   */
+DomainTransitionGraph parseDTG(int varId, SASProblem sp):
+{
+	Token t, t2, t3;
+	//look up the variable for the DTG by looking up varId in the groups created from test.groups
+	DomainTransitionGraph dtg = new DomainTransitionGraph(varId, sp.variables.get(varId));
+	int numberOfTransitions;
+	int targetValue;
+	int operatorIndex;
+	int numberOfConditions;
+	int valueCount;
+}
+{
+	{
+		valueCount = 0; //we are working on this value's outgoing transitions
+	}
+		
+	<BEGIN_DTG>
+	(		
+	 	//parse N dtg blocks
+		t = <NUMBER>
+		{
+			numberOfTransitions = Integer.parseInt(t.toString());
+			
+			for (int i = 0; i < numberOfTransitions; i++)
+			{
+				parseDTGTransition(varId, valueCount, dtg, sp);
+			}
+			
+			valueCount++;
+		}
+		
+		
+	)*
+	
+	
+	<END_DTG>
+	{
+		return dtg;
+	}
+}
+
+void parseDTGTransition(int varId, int sourceValue, DomainTransitionGraph dtg, SASProblem sp):
+{ 
+	Token t, t2, t3;
+}
+{
+	t = <NUMBER> //target value
+	t2 = <NUMBER> //operator/axiom number
+	t3 = <NUMBER> //number of conditions for transition
+	{
+		int targetValue = Integer.parseInt(t.toString());
+		int operatorIndex = Integer.parseInt(t2.toString());
+		int numberOfConditions = Integer.parseInt(t3.toString());
+		
+		SASLiteral source = sp.variables.get(varId).getValue(sourceValue);
+		SASLiteral target = sp.variables.get(varId).getValue(targetValue);
+		
+		//now have to find out whether operatorIndex refers to an axiom or an action operator. This is
+		//based on whether the DTG's variable is derived or not respectively.
+		SASAction operator = null;
+		if (dtg.getVariable() instanceof SASDerivedPredicate)
+		{
+			//axioms are sorted by layer, and rule number, such that 
+			// [layer --> [axiom_number --> axiom]]
+			//This is unfortunate for directly accessing the axiom itself, but useful
+			//for axiom evaluation  
+			operator = sasProblemOptimised.getAxiom(operatorIndex);
+		}
+		else
+		{
+			operator = sasProblemOptimised.actions.get(operatorIndex);
+		}
+		
+		
+		DTGActionEdge edge = new DTGActionEdge(source, operator, target);
+		int[] varVal = null;
+		if (numberOfConditions > 0)
+		{
+			for (int i = 0; i < numberOfConditions; i++)
+			{
+				varVal = parseSASVariableValuePair();
+				
+				int var = this.varIndexMap.get(varVal[0]);
+				//an associated precondition which does not reflect a value within the current variable
+				SASLiteral associated = sp.variables.get(var).getValue(varVal[1]);
+	
+				edge.addAssociatedPrecondition(associated);
+			}
+		}
+//		else//		{//			//if there are no conditions then the "from" prop can be anything, //			//so use a NoneOfThoseProposition instead. Note that this could be compiled out to explit props//			//after the parsing process is complete.//			SASProposition from = new NoneOfThoseProposition();////			dtg.addTransition(from, operator, target);//			edge.setPc(from);//		}
+		dtg.addTransition(edge);
+	}
+			
+}
+
+
+void parseAxioms(SASProblem sp):
+{
+	Token ruleCount;
+	Token conditionCount;
+	Token objectIdTok, conditionTok, effectTok;
+	int objectId, conditionId, effectId;
+	SASParameter obj;
+	SASProposition condition, effect;
+	SASAxiom p;
+	SASDerivedPredicate dp;
+	int count, realPcVar, realEffVar;
+	int[] pcs, eff;
+}
+{	
+	{
+		count = 0;
+	}
+	
+	ruleCount = <NUMBER> //0 if no axioms or > 0
+	(
+		 <BEGIN_RULE>
+		 {
+		 	dp = sp.derivedPredicates.get(count);
+			p = new SASAxiom(count, dp);
+		 }
+		 conditionCount = <NUMBER>
+		 
+		 {
+		 	 int conditionCountInt = Integer.parseInt(conditionCount.toString());
+			 //parse conditions
+			 for (int i = 0; i < conditionCountInt; i++)
+			 {
+			 	 pcs = parseSASVariableValuePair();
+			 	 realPcVar = this.varIndexMap.get(pcs[0]);
+				 p.setEffectCondition(realPcVar, pcs[1]);
+			 }
+		 }
+		 //now parse effect
+		 (
+		 	 eff = parseSASEffect()
+			 {
+				realEffVar = this.varIndexMap.get(eff[0]);
+			 	
+			 	p.setEffect(realEffVar, new SASEffect(eff[1], eff[2]));
+			 }
+		 )*
+			 	
+		 {
+		 	sp.axioms.get(p.getDerivedPredicate().getAxiomLayer()).put(count, p);
+		 	count++;
+		 }
+		 <END_RULE>
+	)* //0 .. many rules possible
+}
+
+void parseSG():
+{
+}
+{
+	<BEGIN_SG>
+	(<NAME> | <NUMBER>)*
+	<END_SG>
+}
+
+void parseTestGroups(SASProblem sp):
+{
+}
+{
+	(
+		parsePddlToSasGroup(sp)
+	)+
+	<EOF>
+	
+	{
+		this.detectVariableNames(sp);
+	}
+}
+
+void parsePddlToSasGroup(SASProblem sp):
+{
+	SASVariable var;
+	Token varTok, derived, value;
+	SASLiteral p;
+	String str;
+	String derivedID;
+	int varId, valueId;
+}
+{
+	varTok = <NAME><SEPARATOR> 
+	{
+		str = varTok.toString().substring(3);
+		varId = Integer.parseInt(str);
+		var = sp.variables.get(varId);
+	}
+	
+	(value = <NUMBER><SEPARATOR>
+	{
+		valueId = Integer.parseInt(value.toString());
+	}
+		(
+			(
+				<ATOM>
+				(
+					{
+					
+						p = parseProposition();
+					}
+				)
+			)
+			|
+			(<NONE_OF_THOSE>
+			{
+				p = new NoneOfThoseProposition();
+			})
+		)
+		{
+			p.setVariableId(varId);
+			p.setValueId(valueId);
+			var.addValue(p, valueId);
+		}
+	)+
+}
+
+
+
+void parseAllGroups(SASProblem sp):
+{
+	Token t;
+	int groupCount = 0;
+	SASMutexGroup g;
+}
+{
+	<BEGIN_GROUPS> t = <NUMBER> 
+	
+	(g = parseGroup(groupCount, sp)
+	{
+		sasProblemAll.mutexes.put(groupCount, g);
+		sasProblemOptimised.mutexes.put(groupCount, g);
+	
+		groupCount++;
+	})*
+	
+	<END_GROUPS>
+	<EOF>
+	
+	{
+		this.detectMutexVariableNames(sp);
+	}
+}
+
+
+
+
+SASMutexGroup parseGroup(int groupNumber, SASProblem sp):
+{
+	Token t;
+	int mutexSize, varId, valueId;
+	SASProposition p;
+	SASDerivedPredicate dp;
+	Token tokVarId, tokValId, tokPredName, tokParam;
+	SASMutexGroup mut;
+	StringBuffer strBuf;
+}
+{
+	<GROUP> t = <NUMBER>
+	{
+		mutexSize = Integer.parseInt(t.toString());
+		mut = new SASMutexGroup();
+		strBuf = new StringBuffer();
+	}
+	(
+		tokVarId = <NUMBER>
+		{
+			varId = Integer.parseInt(tokVarId.toString());
+		}
+		(
+			(
+				p = parseSASProposition(varId)
+				{
+					sasProblemAll.reachableFacts.add(p);
+					sasProblemOptimised.reachableFacts.add(p);
+					
+					//variable may be normal Variable or Derived Predicate
+					SASParameter var = sp.variables.get(varId).getObject();
+					
+					mut.setObject(var); //should retain last val
+					mut.addMutex(p); //add the mutex regardless of the propositions underlying type
+				}
+			)
+		)
+	)+
+	{
+		return mut;
+	}
+}
+
+SASProposition parseProposition():
+{
+	Token tokPredName, tokNumber, tokParam;
+	String predicate;
+	String param;
+	SASProposition p;
+	StringBuffer strBuf = new StringBuffer();
+	boolean isDerived;
+}
+{
+	((
+		tokPredName = <NAME>
+		{
+			isDerived = false;
+		}
+	)
+	|
+	(
+		tokPredName = <NEW_AXIOM>
+		{
+			isDerived = true;
+		}
+	))
+	
+	{
+		strBuf.append(tokPredName.toString());
+	}
+	
+	(<OPEN>)?
+	(
+		tokParam = <NAME>
+		{
+	    	strBuf.append(" "+tokParam.toString());
+		}
+		(<SEPARATOR>)?
+	)*
+	(<CLOSE>)?
+	
+	{
+		StringTokenizer tok = new StringTokenizer(strBuf.toString());
+		if (isDerived)
+			p = new SASDerivedProposition(tok.nextToken());
+		else
+			p = new SASProposition(tok.nextToken());
+		while (tok.hasMoreTokens())
+		{
+			p.addParameter(new SASParameter(tok.nextToken()));
+		}
+		
+		return p;
+	}
+}
+
+SASProposition parseSASProposition(int varId):
+{
+	Token tokGroupId, tokPredName, tokPropId, tokParam;
+	int valueId;
+	String predicate;
+	String param;
+	SASProposition pr;
+	StringBuffer strBuf = new StringBuffer();
+	boolean isDerived;
+}
+{
+	tokPropId = <NUMBER> 
+	
+	(
+		(
+			tokPredName = <NAME>
+			{
+				isDerived = false;
+			}
+		)
+		|
+		(
+			tokPredName = <NEW_AXIOM>
+			{
+				isDerived = true;
+			}
+		)
+	)
+	{
+		strBuf.append(tokPredName.toString());
+		valueId = Integer.parseInt(tokPropId.toString());
+	}
+	
+	<NUMBER> //param count
+	(
+		tokParam = <NAME>
+		{
+	    	strBuf.append(" "+tokParam.toString());
+		}
+	)*
+	{
+		StringTokenizer tok = new StringTokenizer(strBuf.toString());
+		if (isDerived)
+			pr = new SASDerivedProposition(tok.nextToken());
+		else
+			pr = new SASProposition(tok.nextToken());
+			
+		while (tok.hasMoreTokens())
+		{
+			pr.addParameter(new SASParameter(tok.nextToken()));
+		}
+		
+		pr.setVariableId(varId);
+		pr.setValueId(valueId);
+		
+		return pr;
+	}
+}
+
+void parseOutputSAS(SASProblem sp):
+{
+   Token t;
+   boolean suc = true;
+}
+{
+  (parseMetric(sp))?
+  parseVariableSection(sp)
+  parseInitialState(sp)
+  parseGoal(sp)
+  parseOperators(sp)
+  (parseAxioms(sp))?
+  <EOF>
+}
+
+void parseOperators(SASProblem sp):
+{
+	Token t;
+	SASAction a;
+	int operatorCount = 0;
+}
+{
+	t = <NUMBER>
+	
+	(a = parseOperator(operatorCount)
+	{
+		sp.actions.put(operatorCount, a);
+		
+		operatorCount++;
+	})+
+}
+
+SASAction parseOperator(int operatorId):
+{
+	Token t, tvar, told, tnew;
+	SASAction a;
+	String actionName;
+	int prevailCount;
+	int effectCount;
+	int cost;
+	int varId, oldVal, newVal;
+}
+{
+	<BEGIN_OPERATOR> actionName = parseActionName()
+	
+	{
+		a = new SASAction(operatorId, actionName);
+	}
+	
+	//prevail conditions
+	t = <NUMBER>
+	{		prevailCount = Integer.parseInt(t.toString());
+		if (prevailCount > 0)
+		{			for (int i = 0; i < prevailCount; i++)			{				int[] arr = parseSASVariableValuePair();
+				
+				//need to translate the var number into the var index for this file's variable list
+				int var = this.varIndexMap.get(arr[0]);
+				//int val = this.varIndexMap.get(arr[1]);
+				
+				a.setPrevail(var, arr[1]);			}
+		}	}
+	
+	//effect count
+	t = <NUMBER>
+	{
+		effectCount = Integer.parseInt(t.toString());
+
+		for (int i = 0; i < effectCount; i++)
+		{
+			int[] effectConditions = parseEffectConditions();
+			for (int j = 0; j < effectConditions.length; j+=2)
+			{
+				a.setEffectCondition(effectConditions[j], effectConditions[j+1]);
+			}
+			
+			int[] arr = parseSASEffect();
+			//need to translate the var number into the var index for this file's variable list
+			varId = this.varIndexMap.get(arr[0]);
+			oldVal = arr[1];
+			newVal = arr[2];
+			
+			a.setEffect(varId, new SASEffect(oldVal, newVal));
+		}
+	}
+	
+
+	
+
+	//finally, cost
+	t = <NUMBER> <END_OPERATOR>
+	{
+		cost = Integer.parseInt(t.toString());
+		a.setCost(cost);
+	}	
+	
+	
+	
+	{
+		return a;
+	}
+}
+
+int[] parseEffectConditions():
+{
+	Token t, t1, t2;
+	int[] arr;
+}
+{
+	t = <NUMBER>
+	{
+		int effectConditions = Integer.parseInt(t.toString());
+		arr = new int[effectConditions * 2];
+				
+		if (effectConditions > 0)
+		{
+			for (int i = 0; i < effectConditions; i+=2)
+			{
+				int[] pair = parseSASVariableValuePair();
+				arr[i] = pair[0];
+				arr[i+1] = pair[1];
+			}
+		}
+	}
+	{
+		return arr;
+	}
+}
+
+int[] parseSASEffect():
+{
+	Token[] arr;
+	int[] num;
+}
+{
+	{
+		arr = new Token[3];
+		num = new int[3];
+	}
+	
+	arr[0] = <NUMBER> arr[1] = <NUMBER> arr[2] = <NUMBER>
+	
+	{
+		num[0] = Integer.parseInt(arr[0].toString());
+		num[1] = Integer.parseInt(arr[1].toString());
+		num[2] = Integer.parseInt(arr[2].toString());
+		
+		return num;
+	}
+}
+
+String parseActionName():
+{
+	Token tokPredName, tokParam;
+	StringBuffer strBuf = new StringBuffer();
+}
+{
+	tokPredName = <NAME>
+	{
+		strBuf.append(tokPredName.toString());
+	}
+	
+	(<OPEN>)?
+	(
+		tokParam = <NAME>
+		{
+	    	strBuf.append(" "+tokParam.toString());
+		}
+		(<SEPARATOR>)?
+	)*
+	(<CLOSE>)?
+	
+	{
+		return strBuf.toString();
+	}
+}
+
+int[] parseSASVariableValuePair():
+{
+	Token t1, t2;
+	int[] arr = new int[2];
+}
+{
+	t1 = <NUMBER> t2 = <NUMBER>
+	{
+		arr[0] = Integer.parseInt(t1.toString());
+		arr[1] = Integer.parseInt(t2.toString());
+		
+		return arr;
+	}
+}
+
+void parseGoal(SASProblem sp):
+{
+	Token t1, t2;
+	int varId;
+	int varIndex;
+}
+{
+	<BEGIN_GOAL> <NUMBER>
+	(t1 = <NUMBER> t2 = <NUMBER>
+		{
+			varId = Integer.parseInt(t1.toString());
+			varId = this.varIndexMap.get(varId);
+			varIndex = Integer.parseInt(t2.toString());
+			
+			sp.goal.put(varId, varIndex);
+		}
+	)+
+	<END_GOAL>
+}
+
+void parseInitialState(SASProblem sp):{	Token t;	int count = 0;
+	int varId, varIndex;}{	<BEGIN_STATE>	(t = <NUMBER>
+		{
+			varId = this.varIndexMap.get(count);
+			varIndex = Integer.parseInt(t.toString());
+			
+			SASVariable v = sp.variables.get(varId);
+			if (v instanceof SASDerivedPredicate)
+			{
+				//if var is a derived predicate then it also must memorise the default value.
+				((SASDerivedPredicate)v).setDefaultValue(varIndex);
+			}
+			
+			//set initial value
+			v.setCurrentValue(varIndex);
+			sp.initial.put(varId, varIndex);
+			
+			count++;
+		}
+	)+	<END_STATE>}
+
+void parseVariableSection(SASProblem sp):
+{
+   Token t;
+   String var;
+   int varCount = 0;
+   int axiomCount = 0;
+   SASVariable v;
+}
+{
+	<BEGIN_VARIABLES> 
+	t = <NUMBER>	
+	(
+		var = parseVariable()
+		{
+			StringTokenizer strTok = new StringTokenizer(var);
+
+			int variable = Integer.parseInt(strTok.nextToken().substring(3));
+			this.varIndexMap.put(varCount, variable);
+
+			if (sp.variables.containsKey(variable) == false)
+			{
+				int valueCount = Integer.parseInt(strTok.nextToken());
+				int axiomLayer = Integer.parseInt(strTok.nextToken());
+	
+				v = new SASVariable(variable, varCount, valueCount);
+	
+				if (axiomLayer > -1)
+				{
+					v = new SASDerivedPredicate(variable, varCount, valueCount, axiomLayer, "axiom_variable" + axiomCount);
+					
+					if (sp.derivedPredicates.containsKey(axiomCount) == false)
+					{
+						sp.derivedPredicates.put(axiomCount, (SASDerivedPredicate) v);
+					}
+					else
+					{
+						v = sp.derivedPredicates.get(axiomCount);
+					}
+					
+					sp.axioms.put(axiomLayer, new HashMap<Integer, SASAxiom>());
+						
+					axiomCount++;
+				}
+				
+				sp.variables.put(variable, v);
+			}
+			else
+			{
+				v = sp.variables.get(variable);
+			}
+
+			varCount++;
+		}
+	)+
+	
+	<END_VARIABLES>
+}
+
+String parseVariable():
+{	Token tname, t1, tderived;
+	int var, valueCount;
+}
+{//   tname = <NAME> t1=<NUMBER> tderived = <NUMBER> //if derived tderived will be non-zero (see sas-format.txt), otherwise -1
+   tname = <NAME> t1 = <NUMBER> tderived = <NUMBER>
+   {
+	   //var = Integer.parseInt(t1.toString());
+//	   valueCount = Integer.parseInt(t1.toString());  	   return tname.toString() + " "+ t1.toString() + " "+ tderived.toString();
+   }
+   
+}
+
+void parseMetric(SASProblem sp):{
+	Token t;
+}
+{  <BEGIN_METRIC> t = <NUMBER> <END_METRIC>
+  {
+  	 int i = Integer.parseInt(t.toString());
+  	 if (i == 0)
+  	 	sp.optimisePlanLength = true;
+  	 else
+  	 	sp.optimisePlanLength = false;
+  }}
+
